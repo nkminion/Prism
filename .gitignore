@@ -1,2 +1,12 @@
 /Test.png
 /TrialDataset
+
+# Python bytecode cache
+__pycache__/
+
+# Raw dataset files
+raw_*/
+
+# Environment files
+.env*
+!.env.example

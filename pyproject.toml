@@ -1,0 +1,31 @@
+[project]
+name = "prism"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fiftyone>=1.14.0",
+    "imagehash>=4.3.2",
+    "openimages>=0.0.1",
+    "pandas>=3.0.2",
+    "pillow>=12.2.0",
+    "pyinaturalist>=0.21.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+    "tqdm>=4.67.3",
+]
+
+[dependency-groups]
+dev = [
+    "black>=26.3.1",
+    "isort>=8.0.1",
+    "ty>=0.0.27",
+]
+
+[tool.ty]
+# Disable specific rules globally
+rules = { "invalid-method-override" = "warn" }
+
+[tool.ty.environment]
+python = "./.venv"
