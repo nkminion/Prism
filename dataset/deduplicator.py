@@ -1,5 +1,6 @@
 import concurrent.futures
 import json
+import pickle
 from pathlib import Path
 from typing import Optional
 
@@ -8,11 +9,17 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+# Constants
+_THUMB_SIZE = (256, 256)
+
 
 # for multiprocessing
-def _hash_image(img_path: Path, hash_size: int):
+def _hash_image(args: tuple):
+    img_path, hash_size = args
     try:
         with Image.open(img_path) as img:
+            # Huge I/O speedup: tells the JPEG decoder to only load a low-res version
+            img.draft("RGB", _THUMB_SIZE)
             img = img.convert("RGB")
             h = imagehash.phash(img, hash_size=hash_size)
             return img_path, h.hash.flatten()
@@ -30,9 +37,14 @@ class CrossSourceDeduplicator:
     - Minor crops
     """
 
-    def __init__(self, dataset_dir: Path, hash_size: int = 12):
+    def __init__(
+        self, dataset_dir: Path, hash_size: int = 12, cache_file: Optional[Path] = None
+    ):
         self.dataset_dir = Path(dataset_dir)
         self.hash_size = hash_size
+        self.cache_file = (
+            Path(cache_file) if cache_file else self.dataset_dir / ".hash_cache.pkl"
+        )
 
     def deduplicate(
         self,
@@ -72,38 +84,60 @@ class CrossSourceDeduplicator:
         if not all_images:
             return 0
 
-        # Step 2: Parallel Hashing
+        # Step 2: Load Cache
+        cache = self._load_cache()
+
+        need_hashing = [
+            p for p in all_images if str(p) not in cache or cache[str(p)] is None
+        ]
+
+        print(f"  Cache hits : {len(all_images) - len(need_hashing):,}")
+        print(f"  To hash    : {len(need_hashing):,}\n")
+
+        # Step 3: Parallel Hashing
+        if need_hashing:
+            errors = 0
+            args_list = [(p, self.hash_size) for p in need_hashing]
+
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                # Map the hashing function over all images
+                futures = {
+                    executor.submit(_hash_image, arg): arg[0] for arg in args_list
+                }
+
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures),
+                    total=len(need_hashing),
+                    desc="  Hashing",
+                ):
+                    path, hash_array = future.result()
+                    cache[str(path)] = hash_array
+                    if hash_array is None:
+                        errors += 1
+
+            print(f"\n  Finished hashing (errors: {errors})")
+            self._save_cache(cache)
+
+        # Step 4: Filter valid entries and prepare for NumPy
         valid_paths = []
         hash_list = []
-        errors = 0
 
-        # Use ProcessPoolExecutor to max out CPU cores
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers
-        ) as executor:
-            # Map the hashing function over all images
-            futures = {
-                executor.submit(_hash_image, p, self.hash_size): p for p in all_images
-            }
+        # Only process files that still exist on disk and hashed successfully
+        for path in tqdm(all_images, desc="  Preparing Matrix"):
+            path_str = str(path)
+            hash_arr = cache.get(path_str)
+            if hash_arr is not None and path.exists():
+                valid_paths.append(path)
+                hash_list.append(hash_arr)
 
-            for future in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(all_images),
-                desc="  Hashing",
-            ):
-                path, hash_array = future.result()
-                if hash_array is not None:
-                    valid_paths.append(path)
-                    hash_list.append(hash_array)
-                else:
-                    errors += 1
+        print(f"  Valid hashes for comparison: {len(valid_paths):,}\n")
 
-        print(f"\n  Hashed: {len(valid_paths):,} (errors: {errors})")
-
-        if not valid_paths:
+        if len(valid_paths) < 2:
             return 0
 
-        # Step 3: Vectorized NumPy Comparison
+        # Step 5: Vectorized NumPy Comparison
         # Stack all 1D boolean arrays into a single 2D matrix (N x Hash_Length)
         hash_matrix = np.vstack(hash_list)
 
@@ -136,7 +170,7 @@ class CrossSourceDeduplicator:
 
         print(f"\n  Found {len(duplicates):,} duplicates")
 
-        # Step 4: Remove or report
+        # Step 6: Remove or report
         if duplicates:
             # Save report
             report_path = self.dataset_dir / "duplicates_report.json"
@@ -165,6 +199,19 @@ class CrossSourceDeduplicator:
                     )
 
         return len(duplicates)
+
+    def _load_cache(self) -> dict:
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_cache(self, cache_dict: dict) -> None:
+        with open(self.cache_file, "wb") as f:
+            pickle.dump(cache_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _pick_keeper(self, path1: Path, path2: Path) -> tuple:
         """
@@ -209,6 +256,16 @@ if __name__ == "__main__":
         "--threshold", "-t", type=int, default=8, help="Hamming distance threshold"
     )
     parser.add_argument(
+        "--hash-size",
+        "-s",
+        type=int,
+        default=8,
+        help="Hash size (8=64-bit, 12=144-bit)",
+    )
+    parser.add_argument(
+        "--cache", "-c", type=Path, default=None, help="Path to hash cache file"
+    )
+    parser.add_argument(
         "--dry-run", "-n", action="store_true", help="Report only, don't delete"
     )
     parser.add_argument(
@@ -221,7 +278,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    dedup = CrossSourceDeduplicator(args.directory)
+    dedup = CrossSourceDeduplicator(
+        dataset_dir=args.directory, hash_size=args.hash_size, cache_file=args.cache
+    )
+
     dedup.deduplicate(
         threshold=args.threshold, dry_run=args.dry_run, max_workers=args.workers
     )
