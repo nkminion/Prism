@@ -1,27 +1,36 @@
+import concurrent.futures
 import json
-from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 import imagehash
+import numpy as np
 from PIL import Image
 from tqdm import tqdm
+
+
+# for multiprocessing
+def _hash_image(img_path: Path, hash_size: int):
+    try:
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+            h = imagehash.phash(img, hash_size=hash_size)
+            return img_path, h.hash.flatten()
+    except Exception:
+        return img_path, None
 
 
 class CrossSourceDeduplicator:
     """
     Remove near-duplicate images across sources.
 
-    Uses perceptual hashing (pHash) — robust to:
+    Uses perceptual hashing (pHash) - robust to:
     - Different resolutions
     - JPEG compression differences
     - Minor crops
     """
 
-    def __init__(
-        self,
-        dataset_dir: Path,
-        hash_size: int = 12,
-    ):
+    def __init__(self, dataset_dir: Path, hash_size: int = 12):
         self.dataset_dir = Path(dataset_dir)
         self.hash_size = hash_size
 
@@ -29,6 +38,7 @@ class CrossSourceDeduplicator:
         self,
         threshold: int = 8,
         dry_run: bool = False,
+        max_workers: Optional[int] = None,
     ) -> int:
         """
         Find and remove near-duplicate images.
@@ -40,13 +50,14 @@ class CrossSourceDeduplicator:
                        8  = moderate (recommended)
                        12 = loose (similar compositions)
             dry_run:   If True, report but don't delete.
+            max_workers: Max CPU cores to use for hashing. Defaults to all.
 
         Returns:
             Number of duplicates found/removed.
         """
         print(f"\n{'═' * 55}")
         print(f"  🔍 CROSS-SOURCE DEDUPLICATION")
-        print(f"  Hash size: {self.hash_size} │ " f"Threshold: {threshold}")
+        print(f"  Hash size: {self.hash_size} │ Threshold: {threshold}")
         print(f"{'═' * 55}\n")
 
         # Step 1: Collect all images
@@ -58,63 +69,74 @@ class CrossSourceDeduplicator:
         ]
         print(f"  Found {len(all_images):,} images\n")
 
-        # Step 2: Compute perceptual hashes
-        hashes = {}
+        if not all_images:
+            return 0
+
+        # Step 2: Parallel Hashing
+        valid_paths = []
+        hash_list = []
         errors = 0
 
-        for img_path in tqdm(all_images, desc="  Hashing"):
-            try:
-                img = Image.open(img_path).convert("RGB")
-                h = imagehash.phash(
-                    img,
-                    hash_size=self.hash_size,
-                )
-                hashes[img_path] = h
-            except Exception:
-                errors += 1
+        # Use ProcessPoolExecutor to max out CPU cores
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            # Map the hashing function over all images
+            futures = {
+                executor.submit(_hash_image, p, self.hash_size): p for p in all_images
+            }
 
-        print(f"\n  Hashed: {len(hashes):,} " f"(errors: {errors})")
+            for future in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(all_images),
+                desc="  Hashing",
+            ):
+                path, hash_array = future.result()
+                if hash_array is not None:
+                    valid_paths.append(path)
+                    hash_list.append(hash_array)
+                else:
+                    errors += 1
 
-        # Step 3: Group by approximate hash prefix
-        buckets = defaultdict(list)
-        for path, h in hashes.items():
-            prefix = str(h)[:6]  # First 6 hex chars
-            buckets[prefix].append((path, h))
+        print(f"\n  Hashed: {len(valid_paths):,} (errors: {errors})")
 
-        # Step 4: Find duplicates within buckets
+        if not valid_paths:
+            return 0
+
+        # Step 3: Vectorized NumPy Comparison
+        # Stack all 1D boolean arrays into a single 2D matrix (N x Hash_Length)
+        hash_matrix = np.vstack(hash_list)
+
         duplicates = []
         seen = set()
 
-        for prefix, items in tqdm(
-            buckets.items(),
-            desc="  Comparing",
-            total=len(buckets),
-        ):
-            for i in range(len(items)):
-                if items[i][0] in seen:
-                    continue
-                for j in range(i + 1, len(items)):
-                    if items[j][0] in seen:
-                        continue
+        for i in tqdm(range(len(valid_paths)), desc="  Comparing Matrix"):
+            if valid_paths[i] in seen:
+                continue
 
-                    dist = items[i][1] - items[j][1]
-                    if dist <= threshold:
-                        keeper, removal = self._pick_keeper(
-                            items[i][0],
-                            items[j][0],
-                        )
-                        duplicates.append(
-                            {
-                                "removed": str(removal),
-                                "kept": str(keeper),
-                                "distance": dist,
-                            }
-                        )
-                        seen.add(removal)
+            # Vectorized XOR across the remaining rows, then sum to get Hamming distance
+            dists = np.count_nonzero(hash_matrix[i] != hash_matrix[i + 1 :], axis=1)
+
+            # Find indices where distance is within threshold
+            match_indices = np.where(dists <= threshold)[0] + i + 1
+
+            for j in match_indices:
+                if valid_paths[j] not in seen:
+                    keeper, removal = self._pick_keeper(valid_paths[i], valid_paths[j])
+
+                    dist = int(dists[j - (i + 1)])
+                    duplicates.append(
+                        {
+                            "removed": str(removal),
+                            "kept": str(keeper),
+                            "distance": dist,
+                        }
+                    )
+                    seen.add(removal)
 
         print(f"\n  Found {len(duplicates):,} duplicates")
 
-        # Step 5: Remove or report
+        # Step 4: Remove or report
         if duplicates:
             # Save report
             report_path = self.dataset_dir / "duplicates_report.json"
@@ -133,8 +155,7 @@ class CrossSourceDeduplicator:
                 print(f"  ✅ Removed {removed:,} duplicates")
                 return removed
             else:
-                print("  (Dry run — no files deleted)")
-                # Show some examples
+                print("  (Dry run - no files deleted)")
                 for d in duplicates[:5]:
                     print(
                         f"    Would remove: "
@@ -145,11 +166,7 @@ class CrossSourceDeduplicator:
 
         return len(duplicates)
 
-    def _pick_keeper(
-        self,
-        path1: Path,
-        path2: Path,
-    ) -> tuple:
+    def _pick_keeper(self, path1: Path, path2: Path) -> tuple:
         """
         When two images are duplicates, pick which to keep.
 
@@ -177,42 +194,34 @@ class CrossSourceDeduplicator:
                     return score
             return 0
 
-        s1 = _score(path1)
-        s2 = _score(path2)
-
-        if s1 >= s2:
+        if _score(path1) >= _score(path2):
             return path1, path2
-        else:
-            return path2, path1
+        return path2, path1
 
 
 if __name__ == "__main__":
     import argparse
+    import multiprocessing
 
     parser = argparse.ArgumentParser(description="Cross-source image deduplication")
+    parser.add_argument("directory", type=Path, help="Directory to deduplicate")
     parser.add_argument(
-        "directory",
-        type=Path,
-        help="Directory to deduplicate",
+        "--threshold", "-t", type=int, default=8, help="Hamming distance threshold"
     )
     parser.add_argument(
-        "--threshold",
-        "-t",
+        "--dry-run", "-n", action="store_true", help="Report only, don't delete"
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
         type=int,
-        default=8,
-        help="Hamming distance threshold (default: 8)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        "-n",
-        action="store_true",
-        help="Report only, don't delete",
+        default=multiprocessing.cpu_count(),
+        help="Max CPU cores to use",
     )
 
     args = parser.parse_args()
 
     dedup = CrossSourceDeduplicator(args.directory)
     dedup.deduplicate(
-        threshold=args.threshold,
-        dry_run=args.dry_run,
+        threshold=args.threshold, dry_run=args.dry_run, max_workers=args.workers
     )
