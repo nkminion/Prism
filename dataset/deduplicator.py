@@ -1,5 +1,6 @@
 import concurrent.futures
 import json
+import os
 import pickle
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,7 @@ from tqdm import tqdm
 
 # Constants
 _THUMB_SIZE = (256, 256)
+_VALID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 # for multiprocessing
@@ -25,6 +27,36 @@ def _hash_image(args: tuple):
             return img_path, h.hash.flatten()
     except Exception:
         return img_path, None
+
+
+def scan_dir(dirpath):
+    images = []
+    try:
+        with os.scandir(dirpath) as it:
+            subdirs, files = [], []
+            for entry in it:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry.path)
+                elif os.path.splitext(entry.name)[1].lower() in _VALID_EXTENSIONS:
+                    images.append(Path(entry.path))
+    except PermissionError:
+        return [], []
+    return images, subdirs
+
+
+def find_images(root, workers=8):
+    all_images = []
+    queue = [str(root)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        while queue:
+            results = list(pool.map(scan_dir, queue))
+            queue = []
+            for images, subdirs in results:
+                all_images.extend(images)
+                queue.extend(subdirs)
+    return all_images
 
 
 class CrossSourceDeduplicator:
@@ -73,12 +105,8 @@ class CrossSourceDeduplicator:
         print(f"{'═' * 55}\n")
 
         # Step 1: Collect all images
-        extensions = {".jpg", ".jpeg", ".png"}
-        all_images = [
-            p
-            for p in self.dataset_dir.rglob("*")
-            if p.suffix.lower() in extensions and not p.name.startswith(".")
-        ]
+        all_images = find_images(self.dataset_dir)
+
         print(f"  Found {len(all_images):,} images\n")
 
         if not all_images:
