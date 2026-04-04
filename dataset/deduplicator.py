@@ -5,9 +5,9 @@ import pickle
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import imagehash
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
 # Constants
@@ -19,12 +19,14 @@ _VALID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 def _hash_image(args: tuple):
     img_path, hash_size = args
     try:
-        with Image.open(img_path) as img:
-            # Huge I/O speedup: tells the JPEG decoder to only load a low-res version
-            img.draft("RGB", _THUMB_SIZE)
-            img = img.convert("RGB")
-            h = imagehash.phash(img, hash_size=hash_size)
-            return img_path, h.hash.flatten()
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return img_path, None
+
+        img = cv2.resize(img, (hash_size + 1, hash_size))
+        diff = img[:, 1:] > img[:, :-1]  # dhash
+
+        return img_path, diff.flatten()
     except Exception:
         return img_path, None
 
