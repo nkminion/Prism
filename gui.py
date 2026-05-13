@@ -4,10 +4,12 @@ import cv2
 import numpy as np
 from PIL import Image
 import gradio as gr
-from sklearn.neighbors import NearestNeighbors
 import os
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {DEVICE}')
+
+TEMPERATURE = 0.38
 
 class PrismModel(nn.Module):
     def __init__(self):
@@ -96,44 +98,30 @@ class PrismModel(nn.Module):
 
 
 def load_model_and_resources():
-    # Load model
-    model = PrismModel().to(device)
-    model.eval()
-    
     try:
-        checkpoint = torch.load('PrismModel.pth', map_location=device)
-        if isinstance(checkpoint, dict) and 'ModelState' in checkpoint:
-            model.load_state_dict(checkpoint['ModelState'])
-        else:
-            model.load_state_dict(checkpoint)
+        buckets = torch.from_numpy(np.load('CoordBuckets.npy')).float().to(DEVICE)
+        print("Coordinate buckets loaded successfully")
+    except Exception as e:
+        print(f"Error loading coordinate buckets: {e}")
+        buckets = None
+
+    try:
+        checkpoint = torch.load('PrismModel.pth', map_location=DEVICE)
+        model = PrismModel().to(DEVICE)
+        model.load_state_dict(checkpoint['ModelState'])
+        model.eval()
         print("Model loaded successfully")
     except Exception as e:
         print(f"Error loading model: {e}")
         print("Using untrained model")
-    
-    # Load coordinate buckets for color space mapping
-    try:
-        coord_buckets = np.load('CoordBuckets.npy')
-        nn_model = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(coord_buckets)
-        print("Coordinate buckets loaded successfully")
-    except Exception as e:
-        print(f"Error loading coordinate buckets: {e}")
-        coord_buckets = None
-        nn_model = None
-    
-    # Load prior probabilities
-    try:
-        prior_probs = np.load('PriorProbs.npy')
-        print("Prior probabilities loaded successfully")
-    except Exception as e:
-        print(f"Error loading prior probabilities: {e}")
-        prior_probs = None
-    
-    return model, coord_buckets, nn_model, prior_probs
+        model = PrismModel().to(DEVICE)
+        model.eval()
+
+    return model, buckets
 
 
 print("Loading Prism Colorization Model...")
-model, coord_buckets, nn_model, prior_probs = load_model_and_resources()
+model, buckets = load_model_and_resources()
 
 
 @torch.no_grad()
@@ -151,39 +139,41 @@ def colorize_image(input_image):
         input_array = np.array(input_image)
     else:
         input_array = input_image
-    
-    # Convert to grayscale if color
-    if len(input_array.shape) == 3:
-        grayscale = cv2.cvtColor(input_array, cv2.COLOR_RGB2GRAY)
+
+    if len(input_array.shape) == 2:
+        input_array = cv2.cvtColor(input_array, cv2.COLOR_GRAY2RGB)
+    elif input_array.shape[2] == 4:
+        input_array = cv2.cvtColor(input_array, cv2.COLOR_RGBA2RGB)
+
+    h, w = input_array.shape[:2]
+    if h < w:
+        nw = int(w * (256 / h))
+        nh = 256
     else:
-        grayscale = input_array
-    
-    # Resize to 256x256
-    resized = cv2.resize(grayscale, (256, 256), interpolation=cv2.INTER_CUBIC)
-    
-    # Normalize to [0, 1]
-    normalized = resized.astype(np.float32) / 255.0
-    
-    input_tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0).to(device)
-    
-    output = model(input_tensor)  # Shape: (1, 313, 256, 256)
-    
-    color_indices = torch.argmax(output, dim=1).squeeze(0)  # Shape: (256, 256)
-    
-    if coord_buckets is None or nn_model is None:
+        nw = 256
+        nh = int(h * (256 / w))
+
+    resized = cv2.resize(input_array, (nw, nh), interpolation=cv2.INTER_AREA)
+    start_x = (nw - 256) // 2
+    start_y = (nh - 256) // 2
+    cropped = resized[start_y:start_y + 256, start_x:start_x + 256]
+
+    lab_image = cv2.cvtColor(cropped, cv2.COLOR_RGB2LAB)
+    input_tensor = (torch.from_numpy(lab_image[:, :, 0:1]).float() / 255.0).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+
+    output = model(input_tensor)
+    probs = torch.softmax(output / TEMPERATURE, dim=1)
+
+    if buckets is None:
         print("Using fallback grayscale output (coordinate buckets not available)")
-        colorized_rgb = np.stack([resized, resized, resized], axis=-1)
+        colorized_rgb = cropped
     else:
-        color_indices_flat = color_indices.cpu().numpy().flatten()
-        ab_coords = coord_buckets[color_indices_flat]
-        ab_coords = ab_coords.reshape(256, 256, 2)
-        
-        ab_coords = ab_coords + 128.0
-        lab_image = np.dstack([resized * 255.0, ab_coords])
-        
-        # LAB to RGB
-        lab_image = lab_image.astype(np.uint8)
-        colorized_rgb = cv2.cvtColor(lab_image, cv2.COLOR_LAB2RGB)
+        ab = torch.einsum('bchw,cd->bdhw', probs, buckets)
+        input_tensor *= 255.0
+        ab += 128.0
+        result = torch.concat((input_tensor, ab), dim=1).squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
+        result = np.clip(result, 0, 255).astype(np.uint8)
+        colorized_rgb = cv2.cvtColor(result, cv2.COLOR_LAB2RGB)
 
     return Image.fromarray(colorized_rgb.astype('uint8'))
 
@@ -198,7 +188,10 @@ def gradio_colorize(image):
 
 
 def create_interface():
-    with gr.Blocks(title="Prism - Image Colorization") as demo:
+    with gr.Blocks(
+        title="Prism - Image Colorization",
+        theme=gr.themes.Default(primary_hue="blue")
+    ) as demo:
         gr.Markdown("""
         # 🎨 Prism - Image Colorization
         
@@ -268,7 +261,7 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("🎨 PRISM Image Colorization - Gradio App")
     print("="*60)
-    print(f"Device: {device}")
+    print(f"Device: {DEVICE}")
     print(f"CUDA Available: {torch.cuda.is_available()}")
     print("="*60 + "\n")
     
