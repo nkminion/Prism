@@ -1,14 +1,14 @@
-# 🎨 Prism - Image Colorization
+# Prism - Image Colorization
 
 Transform grayscale images into vibrant color photos using deep learning! Prism is a PyTorch-based U-Net model designed to predict and apply colors to black-and-white images.
 
-## 📖 Overview
+## Overview
 
 This project implements an Image Colorization model leveraging a U-Net architecture. The model is trained on the LAB color space, where it takes the grayscale `L` channel as input and predicts the color distribution across 313 discrete `ab` color buckets. 
 
 A user-friendly web interface is provided using **Gradio**, allowing anyone to upload grayscale images and instantly see the colorized output.
 
-## ✨ Features
+## Features
 
 - **U-Net Architecture:** Efficient encoder-decoder structure for high-quality image-to-image translation.
 - **LAB Color Space Prediction:** Predicts quantized color coordinates over 313 discrete buckets for robust colorization.
@@ -16,7 +16,7 @@ A user-friendly web interface is provided using **Gradio**, allowing anyone to u
 - **Multi-GPU Training:** Features a DistributedDataParallel (DDP) training loop for scalable training across multiple GPUs.
 - **Interactive GUI:** An easy-to-use Gradio web app for real-time inference.
 
-## 🧠 Model Architecture
+## Model Architecture
 
 ![Model Architecture](assets/architecture.png)
 
@@ -27,7 +27,7 @@ The model follows a U-Net structure with:
 - **Decoder:** 3 Upsampling blocks using bilinear interpolation and skip connections from the encoder to retain spatial details.
 - **Output:** A final Conv2D layer mapping to 313 output channels (corresponding to the quantized `ab` color buckets).
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
@@ -57,7 +57,7 @@ torchrun --nproc_per_node=2 <exported_script_name>.py
 
 *Note: Make sure you have your dataset organized in the specified directories (`TrainDataset`, `ValDataset`, `TestDataset`) with `L` (grayscale images) and `AB` (target quantized color arrays) subdirectories before training.*
 
-## 📂 Repository Structure
+## Repository Structure
 
 - `Model.ipynb` / `Model.py`: Model definition, PyTorch dataset loaders, DDP training loop, and evaluation scripts.
 - `gui.py`: Gradio application for user-friendly model inference.
@@ -67,11 +67,11 @@ torchrun --nproc_per_node=2 <exported_script_name>.py
 - `examples/`: Sample images to test out the application.
 - `hf-space/`: Files configured for Hugging Face Space deployment.
 
-## 👥 Authors
+## Authors
 
 - **Nishant Kalaichelvan** - [@nkminion](https://github.com/nkminion)
 - **Varun Agnihotri** - [@PythonicVarun](https://github.com/PythonicVarun) - [hello@pythonicvarun.me](mailto:hello@pythonicvarun.me)
 
-## 📜 License
+## License
 
 See the [LICENSE](LICENSE) file for more details.
