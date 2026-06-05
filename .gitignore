@@ -11,3 +11,5 @@
 /TestDataset7
 /TestDataset8
 /TestDataset9
+.venv/
+__pycache__/
